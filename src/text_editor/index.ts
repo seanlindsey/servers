@@ -14,11 +14,13 @@ import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { createTwoFilesPatch } from 'diff';
 import { minimatch } from 'minimatch';
+import { spawn } from 'child_process';
+import { rgPath } from '@vscode/ripgrep';
 
 // Command line argument parsing
 const args = process.argv.slice(2);
 if (args.length === 0) {
-  console.error("Usage: mcp-server-filesystem <allowed-directory> [additional-directories...]");
+  console.error("Usage: mcp-server-text-editor <allowed-directory> [additional-directories...]");
   process.exit(1);
 }
 
@@ -164,6 +166,16 @@ const RemoveFileArgsSchema = z.object({
   path: z.string()
 });
 
+const TextSearchArgsSchema = z.object({
+  path: z.string(),
+  search: z.string(),
+  isRegex: z.boolean().optional().default(false),
+  matchCase: z.boolean().optional().default(false),
+  wholeWord: z.boolean().optional().default(false),
+  includePatterns: z.array(z.string()).optional().default([]),
+  excludePatterns: z.array(z.string()).optional().default([]),
+});
+
 const ToolInputSchema = ToolSchema.shape.inputSchema;
 type ToolInput = z.infer<typeof ToolInputSchema>;
 
@@ -177,11 +189,71 @@ interface FileInfo {
   permissions: string;
 }
 
+interface RipgrepOptions {
+  root: string;
+  query: string;
+  isRegex?: boolean;
+  matchCase?: boolean;
+  wholeWord?: boolean;
+  includes?: string[];
+  excludes?: string[];
+}
+
+async function runRipgrep(opts: RipgrepOptions): Promise<string[]> {
+  const {
+    root,
+    query,
+    isRegex = false,
+    matchCase = false,
+    wholeWord = false,
+    includes = [],
+    excludes = [],
+  } = opts;
+
+  const args = [
+    '--json',
+    '--line-number',
+    '--column',
+    matchCase ? '' : '--ignore-case',
+    wholeWord ? '--word-regexp' : '',
+    isRegex ? '' : '--fixed-strings',
+    ...includes.flatMap(p => ['-g', p]),
+    ...excludes.flatMap(p => ['-g', '!' + p]),
+    '--',
+    query,
+    '.',
+  ].filter(Boolean);
+
+  return new Promise((resolve, reject) => {
+    const proc = spawn(rgPath, args, { cwd: root });
+
+    const hits: string[] = [];
+    proc.stdout.on('data', chunk => {
+      for (const line of chunk.toString().trim().split('\n')) {
+        if (!line) continue;
+        const evt = JSON.parse(line);
+        if (evt.type === 'match') {
+          const { path, line_number, lines } = evt.data;
+          hits.push(`${path.text}:${line_number}:${lines.text.trim()}`);
+        }
+      }
+    });
+
+    proc.stderr.on('data', data => console.error('[rg]', data.toString()));
+
+    proc.on('close', code =>
+      code === 0 || code === 1
+        ? resolve(hits)
+        : reject(new Error(`rg exited ${code}`))
+    );
+  });
+}
+
 // Server setup
 const server = new Server(
   {
-    name: "secure-filesystem-server",
-    version: "0.3.0",
+    name: "text-editor-server",
+    version: "0.1.0",
   },
   {
     capabilities: {
@@ -510,6 +582,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           "without reading the actual content. Only works within allowed directories.",
         inputSchema: zodToJsonSchema(GetFileInfoArgsSchema) as ToolInput,
       },
+      {
+        name: "search_text",
+        description:
+          "VS-Code-style content search (regex | matchCase | wholeWord) with include/exclude globs. " +
+          "Returns one line per match: path:line:preview. Only works within allowed directories.",
+        inputSchema: zodToJsonSchema(TextSearchArgsSchema) as ToolInput,
+      },
     ],
   };
 });
@@ -811,6 +890,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case "search_text": {
+        const parsed = TextSearchArgsSchema.safeParse(args);
+        if (!parsed.success) throw new Error(parsed.error.message);
+
+        const root = await validatePath(parsed.data.path);
+        const results = await runRipgrep({
+          root,
+          query: parsed.data.search,
+          isRegex: parsed.data.isRegex,
+          matchCase: parsed.data.matchCase,
+          wholeWord: parsed.data.wholeWord,
+          includes: parsed.data.includePatterns,
+          excludes: parsed.data.excludePatterns,
+        });
+
+        return {
+          content: [{
+            type: "text",
+            text: results.length ? results.join('\n') : 'No matches found',
+          }],
+        };
+      }
+
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
@@ -827,7 +929,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function runServer() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Secure MCP Filesystem Server running on stdio");
+  console.error("MCP Text Editor Server running on stdio");
   console.error("Allowed directories:", allowedDirectories);
 }
 
