@@ -15,7 +15,36 @@ import { zodToJsonSchema } from "zod-to-json-schema";
 import { createTwoFilesPatch } from 'diff';
 import { minimatch } from 'minimatch';
 import { spawn } from 'child_process';
-import { rgPath } from '@vscode/ripgrep';
+import * as url from 'url';
+
+// Handle workspace setup where node_modules might be hoisted
+const __filename = url.fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+let rgPath: string | undefined;
+try {
+  // Try to import from @vscode/ripgrep
+  const ripgrepModule = await import('@vscode/ripgrep');
+  rgPath = ripgrepModule.rgPath;
+} catch (e) {
+  // Fallback to finding it manually in case of workspace setup
+  const possiblePaths = [
+    path.join(__dirname, '../../../node_modules/@vscode/ripgrep/bin/rg'),
+    path.join(__dirname, '../node_modules/@vscode/ripgrep/bin/rg'),
+    path.join(__dirname, '../../node_modules/@vscode/ripgrep/bin/rg'),
+  ];
+  
+  for (const p of possiblePaths) {
+    try {
+      await fs.access(p, fs.constants.X_OK);
+      rgPath = p;
+      break;
+    } catch {}
+  }
+  
+  if (!rgPath) {
+    console.error('Could not find ripgrep binary');
+  }
+}
 
 // Command line argument parsing
 const args = process.argv.slice(2);
@@ -210,6 +239,10 @@ async function runRipgrep(opts: RipgrepOptions): Promise<string[]> {
     excludes = [],
   } = opts;
 
+  if (!rgPath) {
+    throw new Error('Ripgrep binary not found. Please ensure @vscode/ripgrep is properly installed.');
+  }
+
   const args = [
     '--json',
     '--line-number',
@@ -224,28 +257,49 @@ async function runRipgrep(opts: RipgrepOptions): Promise<string[]> {
     '.',
   ].filter(Boolean);
 
+  console.error(`[search_text] Running ripgrep in ${root} with args:`, args);
+
   return new Promise((resolve, reject) => {
     const proc = spawn(rgPath, args, { cwd: root });
 
     const hits: string[] = [];
+    let stderrData = '';
+    
     proc.stdout.on('data', chunk => {
-      for (const line of chunk.toString().trim().split('\n')) {
-        if (!line) continue;
-        const evt = JSON.parse(line);
-        if (evt.type === 'match') {
-          const { path, line_number, lines } = evt.data;
-          hits.push(`${path.text}:${line_number}:${lines.text.trim()}`);
+      const lines = chunk.toString().split('\n').filter((line: string) => line.trim());
+      for (const line of lines) {
+        try {
+          const evt = JSON.parse(line);
+          if (evt.type === 'match') {
+            const { path, line_number, lines } = evt.data;
+            const textLine = lines.text || '';
+            hits.push(`${path.text}:${line_number}:${textLine.trim()}`);
+          }
+        } catch (e) {
+          console.error('[search_text] Error parsing ripgrep output:', line, e);
         }
       }
     });
 
-    proc.stderr.on('data', data => console.error('[rg]', data.toString()));
+    proc.stderr.on('data', data => {
+      stderrData += data.toString();
+    });
 
-    proc.on('close', code =>
-      code === 0 || code === 1
-        ? resolve(hits)
-        : reject(new Error(`rg exited ${code}`))
-    );
+    proc.on('error', err => {
+      console.error('[search_text] Error spawning ripgrep:', err);
+      reject(err);
+    });
+
+    proc.on('close', code => {
+      if (stderrData) {
+        console.error('[search_text] Ripgrep stderr:', stderrData);
+      }
+      if (code === 0 || code === 1) {
+        resolve(hits);
+      } else {
+        reject(new Error(`ripgrep exited with code ${code}: ${stderrData}`));
+      }
+    });
   });
 }
 
