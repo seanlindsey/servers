@@ -226,6 +226,7 @@ interface RipgrepOptions {
   wholeWord?: boolean;
   includes?: string[];
   excludes?: string[];
+  target?: string; // Optional target path (file or directory)
 }
 
 async function runRipgrep(opts: RipgrepOptions): Promise<string[]> {
@@ -237,6 +238,7 @@ async function runRipgrep(opts: RipgrepOptions): Promise<string[]> {
     wholeWord = false,
     includes = [],
     excludes = [],
+    target = '.',
   } = opts;
 
   if (!rgPath) {
@@ -254,7 +256,7 @@ async function runRipgrep(opts: RipgrepOptions): Promise<string[]> {
     ...excludes.flatMap(p => ['-g', '!' + p]),
     '--',
     query,
-    '.',
+    target,
   ].filter(Boolean);
 
   console.error(`[search_text] Running ripgrep in ${root} with args:`, args);
@@ -948,7 +950,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const parsed = TextSearchArgsSchema.safeParse(args);
         if (!parsed.success) throw new Error(parsed.error.message);
 
-        const root = await validatePath(parsed.data.path);
+        const validPath = await validatePath(parsed.data.path);
+        const stats = await fs.stat(validPath);
+        
+        let root: string;
+        let target: string;
+        
+        if (stats.isFile()) {
+          // If it's a file, search only that file
+          root = path.dirname(validPath);
+          target = path.basename(validPath);
+        } else {
+          // If it's a directory, search the entire directory
+          root = validPath;
+          target = '.';
+        }
+        
         const results = await runRipgrep({
           root,
           query: parsed.data.search,
@@ -957,6 +974,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           wholeWord: parsed.data.wholeWord,
           includes: parsed.data.includePatterns,
           excludes: parsed.data.excludePatterns,
+          target,
         });
 
         return {
